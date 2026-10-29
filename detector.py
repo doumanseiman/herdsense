@@ -1,7 +1,5 @@
-"""Subscribes to every phone, decides who is separated, publishes status + alerts.
+"""Subscribes to every phone, decides who is separated, publishes status + alerts."""
 
-Run on ONE device (laptop or a member's phone):  python detector.py
-"""
 from __future__ import annotations
 
 import json
@@ -30,10 +28,12 @@ def parse(topic: str, payload: bytes):
 
 
 def main() -> None:
-    cfg = Config(separation_m=float(C.env("SEPARATION_M", "100")),
-                 stale_s=float(C.env("STALE_S", "30")),
-                 min_accuracy_m=float(C.env("MIN_ACCURACY_M", "60")),
-                 grace_s=float(C.env("GRACE_S", "60")))
+    cfg = Config(
+        separation_m=float(C.env("SEPARATION_M", "100")),
+        stale_s=float(C.env("STALE_S", "30")),
+        min_accuracy_m=float(C.env("MIN_ACCURACY_M", "60")),
+        grace_s=float(C.env("GRACE_S", "60")),
+    )
     cooldown = float(C.env("ALERT_COOLDOWN_S", "30"))
     members: dict[str, Member] = {}
     memory: dict = {}
@@ -43,7 +43,9 @@ def main() -> None:
 
     def on_connect(c, u, flags, rc, props=None):
         c.subscribe(C.topic("edge", "+", "telemetry"))
-        print(f"[detector] connected, group={C.GROUP_ID[:12]}..., limit={cfg.separation_m:.0f} m")
+        print(
+            f"[detector] connected, group={C.GROUP_ID[:12]}..., limit={cfg.separation_m:.0f} m"
+        )
 
     def on_message(c, u, msg):
         r = parse(msg.topic, msg.payload)
@@ -60,8 +62,13 @@ def main() -> None:
     C.connect(client)
 
     def alert(level: str, who: str, text: str) -> None:
-        client.publish(C.T_ALERTS, json.dumps(
-            {"level": level, "member": who, "message": text, "ts": C.now_ms()}), qos=1)
+        client.publish(
+            C.T_ALERTS,
+            json.dumps(
+                {"level": level, "member": who, "message": text, "ts": C.now_ms()}
+            ),
+            qos=1,
+        )
         print(f"   !! [{level}] {text}")
 
     while True:
@@ -77,13 +84,21 @@ def main() -> None:
         status = {"ts": C.now_ms(), "threshold_m": cfg.separation_m, "members": {}}
         for n, r in res.items():
             m = snap[n]
-            status["members"][n] = {**r, "lat": m.lat, "lon": m.lon, "accuracy_m": m.accuracy_m,
-                                    "motion_rms": m.motion_rms, "age_s": round(now - m.last_seen, 1)}
+            status["members"][n] = {
+                **r,
+                "lat": m.lat,
+                "lon": m.lon,
+                "accuracy_m": m.accuracy_m,
+                "motion_rms": m.motion_rms,
+                "age_s": round(now - m.last_seen, 1),
+            }
         client.publish(C.T_STATUS, json.dumps(status), qos=0, retain=True)
 
         for n, r in res.items():
             cur, prev, d = r["status"], prevs[n], r["distance_m"]
-            if cur == SEPARATED and (prev != SEPARATED or now - last_alert.get(n, 0) >= cooldown):
+            if cur == SEPARATED and (
+                prev != SEPARATED or now - last_alert.get(n, 0) >= cooldown
+            ):
                 last_alert[n] = now
                 alert("warn", n, f"{n} is {d:.0f} m from the group")
             elif cur == WAITING and prev not in (WAITING, SEPARATED):
@@ -93,9 +108,13 @@ def main() -> None:
             elif cur == LOST and prev not in (LOST, None):
                 alert("info", n, f"No signal from {n}")
 
-        print(time.strftime("%H:%M:%S"), " | ".join(
-            f"{n}:{r['status']}:{'-' if r['distance_m'] is None else str(int(r['distance_m'])) + 'm'}"
-            for n, r in res.items()))
+        print(
+            time.strftime("%H:%M:%S"),
+            " | ".join(
+                f"{n}:{r['status']}:{'-' if r['distance_m'] is None else str(int(r['distance_m'])) + 'm'}"
+                for n, r in res.items()
+            ),
+        )
 
 
 if __name__ == "__main__":
