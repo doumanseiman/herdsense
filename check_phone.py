@@ -53,16 +53,47 @@ def c_gps():
 
 def c_mqtt():
     topic = C.topic("selftest", C.MEMBER)
+    connected = threading.Event()
+    subscribed = threading.Event()
     got = threading.Event()
-    c = C.make_client("check", on_connect=lambda c_, u, f, rc, p=None: c_.subscribe(topic),
-                      on_message=lambda c_, u, m: got.set() if m.payload == b"ping" else None)
-    C.connect(c)
-    time.sleep(2)
-    c.publish(topic, b"ping")
-    ok = got.wait(5)
-    c.loop_stop()
-    c.disconnect()
-    return ok, f"round trip via {C.HOST}:{C.PORT}" if ok else f"no echo from {C.HOST}:{C.PORT}"
+    failure = []
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        connected.set()
+        if getattr(reason_code, "is_failure", False):
+            failure.append(f"broker rejected connection: {reason_code}")
+            return
+        client.subscribe(topic)
+
+    def on_subscribe(client, userdata, mid, reason_codes, properties=None):
+        if any(getattr(code, "is_failure", False) for code in reason_codes):
+            failure.append("broker rejected test subscription")
+        else:
+            subscribed.set()
+
+    def on_message(client, userdata, message):
+        if message.payload == b"ping":
+            got.set()
+
+    c = C.make_client("check", on_connect=on_connect, on_message=on_message)
+    c.on_subscribe = on_subscribe
+    try:
+        C.connect(c)
+        if not connected.wait(15):
+            return False, f"connection timeout via {C.HOST}:{C.PORT}"
+        if failure:
+            return False, failure[0]
+        if not subscribed.wait(10):
+            return False, f"subscription timeout via {C.HOST}:{C.PORT}"
+        if failure:
+            return False, failure[0]
+        c.publish(topic, b"ping", qos=1)
+        ok = got.wait(10)
+        detail = f"round trip via {C.HOST}:{C.PORT}" if ok else f"no echo from {C.HOST}:{C.PORT}"
+        return ok, detail
+    finally:
+        c.disconnect()
+        c.loop_stop()
 
 
 if __name__ == "__main__":

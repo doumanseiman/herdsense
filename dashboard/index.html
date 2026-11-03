@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Group Travel Tracker</title>
+<title>HerdSense</title>
 <style>
   :root { --bg:#fff; --fg:#1d1d1f; --muted:#6b6b70; --card:#f5f5f7; --line:#dcdce0;
           --ok:#1d9e75; --warn:#d98a00; --bad:#d64545; --off:#8a8a90; }
@@ -38,7 +38,7 @@
 </style>
 </head>
 <body>
-<h1>Group Travel Tracker</h1>
+<h1>HerdSense</h1>
 <div class="bar">
   <input id="group" placeholder="GROUP_ID">
   <button id="go">Connect</button>
@@ -48,8 +48,8 @@
 <div class="grid">
   <div>
     <div class="card"><h2>Members</h2><div class="scroll"><table>
-      <thead><tr><th>Member</th><th>Status</th><th>Nearest groupmate</th><th>Motion</th><th>GPS acc.</th><th>Seen</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="6" class="empty">Waiting for data...</td></tr></tbody>
+      <thead><tr><th>Member</th><th>Alert status</th><th>Rule baseline</th><th>AI prediction</th><th>Nearest groupmate</th><th>Motion</th><th>GPS acc.</th><th>Seen</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="8" class="empty">Waiting for data...</td></tr></tbody>
     </table></div></div>
     <div class="card"><h2>Alerts</h2><ul id="alerts"><li class="empty">None yet</li></ul></div>
   </div>
@@ -65,20 +65,41 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const LABEL = { TOGETHER:"Together", STRAGGLER_WAITING:"Stopped behind", SEPARATED:"Separated", LOST_SIGNAL:"No signal" };
 const COLOR = { TOGETHER:"var(--ok)", STRAGGLER_WAITING:"var(--warn)", SEPARATED:"var(--bad)", LOST_SIGNAL:"var(--off)" };
-let client = null, status = null, alerts = [], lastStatusAt = 0;
+let client = null, status = null, alerts = [], lastStatusAt = 0, connectedAt = 0;
 
 function setConn(on) { $("conn").style.background = on ? "var(--ok)" : "var(--off)"; $("connText").textContent = on ? "connected" : "disconnected"; }
+function showBanner(message) {
+  $("banner").textContent = message;
+  $("banner").style.display = message ? "block" : "none";
+}
 
 function connect() {
   const g = $("group").value.trim();
-  if (!g || /[+#\/]/.test(g)) return;
+  if (!g) { showBanner("Enter the same GROUP_ID used by the detector and phone simulators."); return; }
+  if (/[+#\/]/.test(g)) { showBanner("GROUP_ID cannot contain MQTT wildcard or slash characters."); return; }
   if (client) client.end(true);
-  status = null; alerts = []; render(); renderAlerts();
+  status = null; alerts = []; connectedAt = 0; lastStatusAt = 0; showBanner(""); render(); renderAlerts();
   client = mqtt.connect(`${P.tls ? "wss" : "ws"}://${P.host}:${P.port}/mqtt`,
     { username: P.user, password: P.pass, clientId: "dash-" + Math.random().toString(16).slice(2, 8), reconnectPeriod: 2000 });
-  client.on("connect", () => { setConn(true); client.subscribe([`trip/${g}/status`, `trip/${g}/alerts`]); });
-  client.on("close", () => setConn(false));
-  client.on("message", (topic, payload) => {
+  const connection = client;
+  connection.on("connect", () => {
+    if (client !== connection) return;
+    connectedAt = Date.now();
+    setConn(true);
+    connection.subscribe([`trip/${g}/status`, `trip/${g}/alerts`], err => {
+      if (err && client === connection) showBanner("Connected to MQTT, but could not subscribe: " + err.message);
+    });
+  });
+  connection.on("close", () => {
+    if (client !== connection) return;
+    setConn(false);
+    showBanner("Dashboard connection to the MQTT broker closed. Check internet and reconnect.");
+  });
+  connection.on("error", err => {
+    if (client === connection) showBanner("MQTT connection error: " + err.message);
+  });
+  connection.on("message", (topic, payload) => {
+    if (client !== connection) return;
     let d; try { d = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
     if (topic.endsWith("/status")) { status = d; lastStatusAt = Date.now(); render(); }
     else if (topic.endsWith("/alerts")) { alerts.unshift(d); alerts = alerts.slice(0, 30); renderAlerts(); }
@@ -87,10 +108,12 @@ function connect() {
 
 function render() {
   const rows = $("rows");
-  if (!status) { rows.innerHTML = '<tr><td colspan="6" class="empty">Waiting for data...</td></tr>'; $("map").innerHTML = ""; return; }
+  if (!status) { rows.innerHTML = '<tr><td colspan="8" class="empty">Waiting for data...</td></tr>'; $("map").innerHTML = ""; return; }
   rows.innerHTML = Object.entries(status.members).sort().map(([n, m]) => `<tr>
     <td>${esc(n)}</td>
     <td><span class="badge" style="background:${COLOR[m.status] || "var(--off)"}">${esc(LABEL[m.status] || m.status)}</span></td>
+    <td>${esc(LABEL[m.rule_status] || m.rule_status || "-")}</td>
+    <td title="${m.ai_status ? esc(m.ai_reason || "AI prediction from the rolling sensor window") : "No trained model loaded"}">${m.ai_status ? esc(LABEL[m.ai_status] || m.ai_status) + " (" + esc(Math.round(m.ai_confidence * 100)) + "%)" : "-"}</td>
     <td>${m.distance_m == null ? "-" : esc(Math.round(m.distance_m)) + " m" + (m.nearest ? " (" + esc(m.nearest) + ")" : "")}</td>
     <td>${m.motion_rms == null ? "?" : (m.moving ? "moving" : "still")}</td>
     <td>${m.accuracy_m == null ? "-" : esc(Math.round(m.accuracy_m)) + " m"}</td>
@@ -123,7 +146,17 @@ function renderMap() {
   $("map").innerHTML = svg;
 }
 
-setInterval(() => { $("banner").style.display = (status && Date.now() - lastStatusAt > 6000) ? "block" : "none"; }, 1000);
+setInterval(() => {
+  if (status && Date.now() - lastStatusAt > 6000) {
+    showBanner("No recent detector updates. Check that detector.py is running and uses this GROUP_ID.");
+  } else if (!status && client?.connected && connectedAt && Date.now() - connectedAt > 6000) {
+    showBanner("Connected to MQTT, but no detector status arrived. Check that detector.py is running and all devices use the same GROUP_ID.");
+  } else if (!status && client?.connected) {
+    showBanner("");
+  } else if (!client?.connected && !$("banner").textContent.startsWith("MQTT connection error")) {
+    showBanner("");
+  }
+}, 1000);
 $("go").onclick = connect;
 $("group").onkeydown = e => { if (e.key === "Enter") connect(); };
 if (q.get("group")) { $("group").value = q.get("group"); connect(); }

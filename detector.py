@@ -5,11 +5,27 @@ Run on ONE device (laptop or a member's phone):  python detector.py
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
+import uuid
+from pathlib import Path
 
 import common as C
-from rules import LOST, SEPARATED, TOGETHER, WAITING, Config, Member, evaluate
+from ai_model import GradientBoostingModel
+from data_logger import DetectorCsvLogger
+from features import build_features
+from rules import (
+    INITIALIZING,
+    LOST,
+    SEPARATED,
+    TOGETHER,
+    WAITING,
+    Config,
+    Member,
+    debounce_status,
+    evaluate,
+)
 
 
 def parse(topic: str, payload: bytes):
@@ -24,7 +40,11 @@ def parse(topic: str, payload: bytes):
         rms = None if rms is None else float(rms)
     except (ValueError, KeyError, TypeError, IndexError):
         return None
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+    if seq < 0 or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    if not all(math.isfinite(value) for value in (acc,)):
+        return None
+    if acc < 0 or (rms is not None and (not math.isfinite(rms) or rms < 0)):
         return None
     return name, seq, lat, lon, acc, rms
 
@@ -33,19 +53,49 @@ def main() -> None:
     cfg = Config(separation_m=float(C.env("SEPARATION_M", "100")),
                  stale_s=float(C.env("STALE_S", "30")),
                  min_accuracy_m=float(C.env("MIN_ACCURACY_M", "60")),
-                 grace_s=float(C.env("GRACE_S", "60")))
+                 grace_s=float(C.env("GRACE_S", "60")),
+                 min_separation_m=float(C.env("MIN_SEPARATION_M", "50")),
+                 smoothing_samples=int(C.env("SMOOTHING_SAMPLES", "3")))
     cooldown = float(C.env("ALERT_COOLDOWN_S", "30"))
+    debounce_samples = int(C.env("DEBOUNCE_SAMPLES", "3"))
+    window_s = float(C.env("FEATURE_WINDOW_S", "30"))
+    confidence_threshold = float(C.env("AI_CONFIDENCE_THRESHOLD", "0.75"))
+    ai_mode = C.env("AI_MODE", "shadow").lower()
+    if ai_mode not in ("shadow", "assist"):
+        raise ValueError("AI_MODE must be 'shadow' or 'assist'")
+    if debounce_samples < 1 or window_s <= 0 or not 0 <= confidence_threshold <= 1:
+        raise ValueError("Invalid debounce, feature-window, or AI confidence configuration")
+
+    model_path = Path(C.env("AI_MODEL_PATH", "models/herdsense_gbc.json"))
+    if not model_path.is_absolute():
+        model_path = C.ROOT / model_path
+    ai_model = GradientBoostingModel.load(model_path) if model_path.exists() else None
+    if ai_model:
+        print(f"[detector] AI model loaded ({ai_mode} mode): {model_path}")
+    else:
+        print(f"[detector] AI model not found; using rule-based status only: {model_path}")
+
+    session_id = uuid.uuid4().hex
+    log_path = Path(C.env("DATA_LOG_PATH", "data/detector.csv"))
+    if not log_path.is_absolute():
+        log_path = C.ROOT / log_path
+    csv_logger = DetectorCsvLogger(log_path, session_id)
+    print(f"[detector] logging feature windows to {log_path} (session {session_id[:8]})")
+
     members: dict[str, Member] = {}
     memory: dict = {}
+    stable_rules: dict[str, dict] = {}
+    stable_statuses: dict[str, dict] = {}
+    histories: dict[str, list[dict]] = {}
     last_seq: dict[str, int] = {}
     last_alert: dict[str, float] = {}
     lock = threading.Lock()
 
-    def on_connect(c, u, flags, rc, props=None):
+    def on_connect(c, _userdata, _flags, _reason_code, _properties=None):
         c.subscribe(C.topic("edge", "+", "telemetry"))
         print(f"[detector] connected, group={C.GROUP_ID[:12]}..., limit={cfg.separation_m:.0f} m")
 
-    def on_message(c, u, msg):
+    def on_message(_client, _userdata, msg):
         r = parse(msg.topic, msg.payload)
         if not r:
             return
@@ -65,23 +115,78 @@ def main() -> None:
         print(f"   !! [{level}] {text}")
 
     while True:
-        time.sleep(1)
+        time.sleep(4)
         now = time.time()
         with lock:
             snap = dict(members)
         if not snap:
             continue
-        prevs = {n: memory.get(n, {}).get("status") for n in snap}
+        prevs = {n: stable_statuses.get(n, {}).get("stable") for n in snap}
         res = evaluate(snap, now, cfg, memory)
 
         status = {"ts": C.now_ms(), "threshold_m": cfg.separation_m, "members": {}}
         for n, r in res.items():
             m = snap[n]
-            status["members"][n] = {**r, "lat": m.lat, "lon": m.lon, "accuracy_m": m.accuracy_m,
-                                    "motion_rms": m.motion_rms, "age_s": round(now - m.last_seen, 1)}
+            age_s = round(now - m.last_seen, 1)
+            history = histories.setdefault(n, [])
+            history.append({
+                "ts": now, "lat": m.lat, "lon": m.lon, "accuracy_m": m.accuracy_m,
+                "motion_rms": m.motion_rms, "distance_m": r["distance_m"],
+            })
+            cutoff = now - window_s
+            while history and history[0]["ts"] < cutoff:
+                history.pop(0)
+            features = build_features(history, m, r["distance_m"], age_s, now, window_s)
+
+            rule_status = debounce_status(r["status"], stable_rules.setdefault(n, {}), debounce_samples)
+            ai_status, ai_confidence = "", None
+            if ai_model is not None and rule_status != INITIALIZING:
+                ai_status, ai_confidence = ai_model.predict(features)
+            ai_reason = None
+            if ai_status:
+                ai_reason = (
+                    f"{features['samples_in_window']:.0f} samples / {window_s:.0f}s; "
+                    f"distance={features['nearest_distance_m']:.0f}m, "
+                    f"trend={features['distance_trend_mps']:+.2f}m/s, "
+                    f"speed={features['speed_mps']:.2f}m/s, "
+                    f"motion RMS={features['motion_rms']:.2f}, "
+                    f"GPS accuracy={features['accuracy_m']:.0f}m"
+                )
+
+            proposed_status = rule_status
+            if (ai_mode == "assist" and ai_status == SEPARATED
+                    and ai_confidence is not None and ai_confidence >= confidence_threshold
+                    and rule_status == WAITING):
+                proposed_status = SEPARATED
+            if ai_mode == "shadow" or ai_model is None:
+                final_status = rule_status
+                stable_statuses.setdefault(n, {})["stable"] = final_status
+            else:
+                final_status = debounce_status(
+                    proposed_status, stable_statuses.setdefault(n, {}), debounce_samples
+                )
+            member_status = {
+                **r,
+                "rule_status": rule_status,
+                "status": final_status,
+                "ai_status": ai_status or None,
+                "ai_confidence": None if ai_confidence is None else round(ai_confidence, 3),
+                "ai_reason": ai_reason,
+                "ai_mode": ai_mode,
+                "lat": m.lat,
+                "lon": m.lon,
+                "accuracy_m": m.accuracy_m,
+                "motion_rms": m.motion_rms,
+                "age_s": age_s,
+                "features": features,
+            }
+            status["members"][n] = member_status
+            csv_logger.log(
+                status["ts"], n, features, rule_status, final_status, ai_status, ai_confidence
+            )
         client.publish(C.T_STATUS, json.dumps(status), qos=0, retain=True)
 
-        for n, r in res.items():
+        for n, r in status["members"].items():
             cur, prev, d = r["status"], prevs[n], r["distance_m"]
             if cur == SEPARATED and (prev != SEPARATED or now - last_alert.get(n, 0) >= cooldown):
                 last_alert[n] = now
@@ -94,8 +199,9 @@ def main() -> None:
                 alert("info", n, f"No signal from {n}")
 
         print(time.strftime("%H:%M:%S"), " | ".join(
-            f"{n}:{r['status']}:{'-' if r['distance_m'] is None else str(int(r['distance_m'])) + 'm'}"
-            for n, r in res.items()))
+            f"{n}:{r['status']} (rules:{r['rule_status']}, ai:{r['ai_status'] or '-'})"
+            f":{'-' if r['distance_m'] is None else str(int(r['distance_m'])) + 'm'}"
+            for n, r in status["members"].items()))
 
 
 if __name__ == "__main__":

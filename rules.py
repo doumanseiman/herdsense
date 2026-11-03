@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
 
 TOGETHER, WAITING, SEPARATED, LOST = "TOGETHER", "STRAGGLER_WAITING", "SEPARATED", "LOST_SIGNAL"
+INITIALIZING = "INITIALIZING"
 
 
 @dataclass
 class Config:
     separation_m: float = 100.0   # "far from group" distance
+    min_separation_m: float = 50.0
     hysteresis: float = 0.8       # must come back inside 80% of the limit to be TOGETHER again
     stale_s: float = 30.0         # no data this long -> LOST_SIGNAL
     min_accuracy_m: float = 60.0  # worse GPS than this -> LOST_SIGNAL
     still_rms: float = 0.35       # accelerometer std-dev below this = standing still
     grace_s: float = 60.0         # stopped + far this long -> SEPARATED
+    smoothing_samples: int = 3
 
 
 @dataclass
@@ -64,17 +68,37 @@ def evaluate(members: dict[str, Member], now: float, cfg: Config, memory: dict) 
         mem = memory.setdefault(name, {})
         prev = mem.get("status")
         moving = is_moving(m, cfg)
-        dist, nearest = None, None
+        dist, raw_dist, nearest, threshold = None, None, None, cfg.separation_m
         if name not in usable:
             status = LOST
             mem.pop("over_since", None)
+            mem.pop("distance_samples", None)
+            mem.pop("distance_peer", None)
         else:
             others = [o for n, o in usable.items() if n != name]
             if not others:
                 status = TOGETHER  # nobody to compare with
+                mem.pop("distance_samples", None)
+                mem.pop("distance_peer", None)
             else:
-                dist, nearest = min((haversine_m(m.lat, m.lon, o.lat, o.lon), o.name) for o in others)
-                limit = cfg.separation_m * (cfg.hysteresis if prev in (WAITING, SEPARATED) else 1.0)
+                nearest_member = min(
+                    others, key=lambda o: haversine_m(m.lat, m.lon, o.lat, o.lon)
+                )
+                raw_dist = haversine_m(m.lat, m.lon, nearest_member.lat, nearest_member.lon)
+                nearest = nearest_member.name
+                if mem.get("distance_peer") != nearest:
+                    mem["distance_samples"] = []
+                    mem["distance_peer"] = nearest
+                threshold = max(
+                    cfg.separation_m,
+                    cfg.min_separation_m,
+                    math.hypot(m.accuracy_m, nearest_member.accuracy_m),
+                )
+                samples = mem.setdefault("distance_samples", [])
+                samples.append(raw_dist)
+                del samples[:-max(1, cfg.smoothing_samples)]
+                dist = statistics.median(samples)
+                limit = threshold * (cfg.hysteresis if prev in (WAITING, SEPARATED) else 1.0)
                 if dist <= limit:
                     status = TOGETHER
                     mem.pop("over_since", None)
@@ -87,6 +111,30 @@ def evaluate(members: dict[str, Member], now: float, cfg: Config, memory: dict) 
         mem["status"] = status
         out[name] = {"status": status,
                      "distance_m": None if dist is None else round(dist, 1),
+                     "raw_distance_m": None if raw_dist is None else round(raw_dist, 1),
+                     "threshold_m": round(threshold, 1),
                      "nearest": nearest,
                      "moving": moving}
     return out
+
+
+def debounce_status(candidate: str, state: dict, required_samples: int) -> str:
+    """Only publish a state after it has appeared in consecutive detector cycles."""
+    required = max(1, required_samples)
+    if candidate == state.get("stable"):
+        state.pop("pending", None)
+        state.pop("count", None)
+        return candidate
+
+    if candidate == state.get("pending"):
+        state["count"] += 1
+    else:
+        state["pending"] = candidate
+        state["count"] = 1
+
+    if state["count"] >= required:
+        state["stable"] = candidate
+        state.pop("pending", None)
+        state.pop("count", None)
+        return candidate
+    return state.get("stable", INITIALIZING)
