@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 
 import common as C
-from ai_model import GradientBoostingModel
+from ai_model import OnlineGaussianNB, group_model_path
 from data_logger import DetectorCsvLogger
 from features import build_features
 from rules import (
@@ -59,21 +59,22 @@ def main() -> None:
     cooldown = float(C.env("ALERT_COOLDOWN_S", "30"))
     debounce_samples = int(C.env("DEBOUNCE_SAMPLES", "3"))
     window_s = float(C.env("FEATURE_WINDOW_S", "30"))
-    confidence_threshold = float(C.env("AI_CONFIDENCE_THRESHOLD", "0.75"))
-    ai_mode = C.env("AI_MODE", "shadow").lower()
-    if ai_mode not in ("shadow", "assist"):
-        raise ValueError("AI_MODE must be 'shadow' or 'assist'")
+    confidence_threshold = float(C.env("AI_MIN_CONFIDENCE", "0.60"))
+    ai_min_samples = int(C.env("AI_MIN_SAMPLES_PER_CLASS", "5"))
     if debounce_samples < 1 or window_s <= 0 or not 0 <= confidence_threshold <= 1:
         raise ValueError("Invalid debounce, feature-window, or AI confidence configuration")
+    if ai_min_samples < 2:
+        raise ValueError("AI_MIN_SAMPLES_PER_CLASS must be at least 2")
 
-    model_path = Path(C.env("AI_MODEL_PATH", "models/herdsense_gbc.json"))
+    model_path = Path(C.env("AI_STATE_PATH", "models/herdsense_online.json"))
     if not model_path.is_absolute():
         model_path = C.ROOT / model_path
-    ai_model = GradientBoostingModel.load(model_path) if model_path.exists() else None
-    if ai_model:
-        print(f"[detector] AI model loaded ({ai_mode} mode): {model_path}")
-    else:
-        print(f"[detector] AI model not found; using rule-based status only: {model_path}")
+    model_path = group_model_path(model_path, C.GROUP_ID)
+    ai_model = OnlineGaussianNB.load_or_create(model_path, ai_min_samples)
+    print(
+        f"[detector] online AI ready; per-class warm-up={ai_min_samples} samples, "
+        f"state={model_path}"
+    )
 
     session_id = uuid.uuid4().hex
     log_path = Path(C.env("DATA_LOG_PATH", "data/detector.csv"))
@@ -87,6 +88,7 @@ def main() -> None:
     stable_rules: dict[str, dict] = {}
     stable_statuses: dict[str, dict] = {}
     histories: dict[str, list[dict]] = {}
+    last_training_signature: dict[str, tuple] = {}
     last_seq: dict[str, int] = {}
     last_alert: dict[str, float] = {}
     lock = threading.Lock()
@@ -139,9 +141,9 @@ def main() -> None:
             features = build_features(history, m, r["distance_m"], age_s, now, window_s)
 
             rule_status = debounce_status(r["status"], stable_rules.setdefault(n, {}), debounce_samples)
-            ai_status, ai_confidence = "", None
-            if ai_model is not None and rule_status != INITIALIZING:
-                ai_status, ai_confidence = ai_model.predict(features)
+            proposed_status, status_source, ai_status, ai_confidence = ai_model.decide(
+                rule_status, features, confidence_threshold
+            )
             ai_reason = None
             if ai_status:
                 ai_reason = (
@@ -153,26 +155,29 @@ def main() -> None:
                     f"GPS accuracy={features['accuracy_m']:.0f}m"
                 )
 
-            proposed_status = rule_status
-            if (ai_mode == "assist" and ai_status == SEPARATED
-                    and ai_confidence is not None and ai_confidence >= confidence_threshold
-                    and rule_status == WAITING):
-                proposed_status = SEPARATED
-            if ai_mode == "shadow" or ai_model is None:
-                final_status = rule_status
-                stable_statuses.setdefault(n, {})["stable"] = final_status
-            else:
-                final_status = debounce_status(
-                    proposed_status, stable_statuses.setdefault(n, {}), debounce_samples
-                )
+            final_status = debounce_status(
+                proposed_status, stable_statuses.setdefault(n, {}), debounce_samples
+            )
+
+            training_signature = (
+                m.last_seen, rule_status, r["distance_m"], r["nearest"]
+            )
+            if (rule_status != INITIALIZING
+                    and last_training_signature.get(n) != training_signature):
+                ai_model.update(rule_status, features)
+                last_training_signature[n] = training_signature
+                ai_model.save(model_path)
             member_status = {
                 **r,
                 "rule_status": rule_status,
                 "status": final_status,
-                "ai_status": ai_status or None,
+                "ai_status": ai_status,
                 "ai_confidence": None if ai_confidence is None else round(ai_confidence, 3),
                 "ai_reason": ai_reason,
-                "ai_mode": ai_mode,
+                "status_source": status_source,
+                "ai_model_ready": ai_model.is_ready,
+                "ai_training_samples": sum(ai_model.sample_counts.values()),
+                "ai_samples_per_class": ai_model.sample_counts,
                 "lat": m.lat,
                 "lon": m.lon,
                 "accuracy_m": m.accuracy_m,
@@ -199,7 +204,7 @@ def main() -> None:
                 alert("info", n, f"No signal from {n}")
 
         print(time.strftime("%H:%M:%S"), " | ".join(
-            f"{n}:{r['status']} (rules:{r['rule_status']}, ai:{r['ai_status'] or '-'})"
+        f"{n}:{r['status']} ({r['status_source']}, ai:{r['ai_status'] or 'learning'})"
             f":{'-' if r['distance_m'] is None else str(int(r['distance_m'])) + 'm'}"
             for n, r in status["members"].items()))
 

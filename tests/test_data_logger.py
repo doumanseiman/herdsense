@@ -5,7 +5,6 @@ from pathlib import Path
 
 from data_logger import CSV_COLUMNS, DetectorCsvLogger
 from features import FEATURE_NAMES
-from prepare_dataset import prepare
 
 
 class DetectorCsvLoggerTest(unittest.TestCase):
@@ -30,30 +29,6 @@ class DetectorCsvLoggerTest(unittest.TestCase):
             path.write_text("wrong,header\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "unexpected CSV header"):
                 DetectorCsvLogger(path, "session-a")
-
-    def test_prepares_only_labeled_rows(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "detector.csv"
-            logger = DetectorCsvLogger(source, "session-a")
-            logger.log(1234, "ayu", {name: 1.0 for name in FEATURE_NAMES},
-                       "TOGETHER", "TOGETHER")
-            logger.close()
-            with source.open(newline="", encoding="utf-8") as file:
-                rows = list(csv.DictReader(file))
-            rows[0]["label"] = "TOGETHER"
-            with source.open("w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=CSV_COLUMNS)
-                writer.writeheader()
-                writer.writerows(rows)
-
-            output = root / "training.csv"
-            self.assertEqual(prepare([source], output), 1)
-            with output.open(newline="", encoding="utf-8") as file:
-                row = next(csv.DictReader(file))
-            self.assertEqual(row["label"], "TOGETHER")
-            self.assertEqual(row["member"], "ayu")
-
 
 if __name__ == "__main__":
     unittest.main()
