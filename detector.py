@@ -15,6 +15,7 @@ import common as C
 from ai_model import HerdSenseModel
 from data_logger import DetectorCsvLogger
 from features import build_features
+from ml_labels import APART, MOVING_AWAY, SAFE, STRAGGLER
 from rules import (
     LOST,
     SEPARATED,
@@ -165,11 +166,13 @@ def main() -> None:
 
             rule_status = r["status"]
             if rule_status == LOST:
+                candidate_status = LOST
                 ai_status, ai_confidence = None, None
                 status_source = "RULE_SAFETY"
             else:
                 ai_status, ai_confidence = ai_model.predict(features)
-                status_source = "RULES"
+                candidate_status = ai_status
+                status_source = "AI_MODEL"
 
             ai_reason = None
             if ai_status is not None:
@@ -183,7 +186,7 @@ def main() -> None:
                 )
 
             final_status = debounced_status(
-                rule_status, stable_statuses.setdefault(n, {}), debounce_samples
+                candidate_status, stable_statuses.setdefault(n, {}), debounce_samples
             )
             member_status = {
                 **r,
@@ -209,12 +212,14 @@ def main() -> None:
         for n, r in status["members"].items():
             cur, prev, d = r["status"], prevs[n], r["distance_m"]
             distance_text = format_distance(d)
-            if cur == SEPARATED and (prev != SEPARATED or now - last_alert.get(n, 0) >= cooldown):
+            if cur in (APART, SEPARATED) and (prev not in (APART, SEPARATED) or now - last_alert.get(n, 0) >= cooldown):
                 last_alert[n] = now
                 alert("warn", n, f"{n} is {distance_text} from the group")
-            elif cur == WAITING and prev not in (WAITING, SEPARATED):
+            elif cur in (MOVING_AWAY,) and prev not in (MOVING_AWAY, APART, SEPARATED):
+                alert("info", n, f"{n} is starting to drift away ({distance_text})")
+            elif cur in (STRAGGLER, WAITING) and prev not in (STRAGGLER, WAITING, APART, SEPARATED):
                 alert("info", n, f"{n} stopped {distance_text} from the group")
-            elif cur == TOGETHER and prev in (WAITING, SEPARATED):
+            elif cur in (SAFE, TOGETHER) and prev in (MOVING_AWAY, STRAGGLER, WAITING, APART, SEPARATED):
                 alert("info", n, f"{n} is back with the group")
             elif cur == LOST and prev not in (LOST, None):
                 alert("info", n, f"No signal from {n}")
