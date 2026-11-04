@@ -110,7 +110,7 @@ function connect() {
   connection.on("message", (topic, payload) => {
     if (client !== connection) return;
     let d; try { d = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
-    if (topic.endsWith("/status")) { status = d; lastStatusAt = Date.now(); render(); }
+    if (topic.endsWith("/status")) { status = d; lastStatusAt = Date.now(); showBanner(""); render(); }
     else if (topic.endsWith("/alerts")) { alerts.unshift(d); alerts = alerts.slice(0, 30); renderAlerts(); }
   });
 }
@@ -160,7 +160,7 @@ setInterval(() => {
     showBanner("No recent detector updates. Check that detector.py is running and uses this GROUP_ID.");
   } else if (!status && client?.connected && connectedAt && Date.now() - connectedAt > 6000) {
     showBanner("Connected to MQTT, but no detector status arrived. Check that detector.py is running and all devices use the same GROUP_ID.");
-  } else if (!status && client?.connected) {
+  } else if (status && client?.connected && Date.now() - lastStatusAt <= 6000) {
     showBanner("");
   } else if (!client?.connected && !$("banner").textContent.startsWith("MQTT connection error")) {
     showBanner("");
