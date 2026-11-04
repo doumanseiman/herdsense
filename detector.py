@@ -12,11 +12,10 @@ import uuid
 from pathlib import Path
 
 import common as C
-from ai_model import OnlineGaussianNB, group_model_path
+from ai_model import HerdSenseModel
 from data_logger import DetectorCsvLogger
 from features import build_features
 from rules import (
-    INITIALIZING,
     LOST,
     SEPARATED,
     TOGETHER,
@@ -49,6 +48,39 @@ def parse(topic: str, payload: bytes):
     return name, seq, lat, lon, acc, rms
 
 
+def append_history_sample(
+    history: list[dict],
+    member: Member,
+    distance_m: float | None,
+    received_at: float,
+    last_seen: float | None,
+) -> bool:
+    """Append only when this member has delivered a new telemetry sample."""
+    if last_seen == member.last_seen:
+        return False
+    history.append({
+        "ts": received_at,
+        "lat": member.lat,
+        "lon": member.lon,
+        "accuracy_m": member.accuracy_m,
+        "motion_rms": member.motion_rms,
+        "distance_m": distance_m,
+    })
+    return True
+
+
+def format_distance(distance_m: float | None) -> str:
+    return "unknown distance" if distance_m is None else f"{distance_m:.0f} m"
+
+
+def debounced_status(rule_status: str, state: dict, required_samples: int) -> str:
+    if rule_status == LOST:
+        state.clear()
+        state["stable"] = LOST
+        return LOST
+    return debounce_status(rule_status, state, required_samples)
+
+
 def main() -> None:
     cfg = Config(separation_m=float(C.env("SEPARATION_M", "100")),
                  stale_s=float(C.env("STALE_S", "30")),
@@ -59,22 +91,14 @@ def main() -> None:
     cooldown = float(C.env("ALERT_COOLDOWN_S", "30"))
     debounce_samples = int(C.env("DEBOUNCE_SAMPLES", "3"))
     window_s = float(C.env("FEATURE_WINDOW_S", "30"))
-    confidence_threshold = float(C.env("AI_MIN_CONFIDENCE", "0.60"))
-    ai_min_samples = int(C.env("AI_MIN_SAMPLES_PER_CLASS", "5"))
-    if debounce_samples < 1 or window_s <= 0 or not 0 <= confidence_threshold <= 1:
-        raise ValueError("Invalid debounce, feature-window, or AI confidence configuration")
-    if ai_min_samples < 2:
-        raise ValueError("AI_MIN_SAMPLES_PER_CLASS must be at least 2")
+    if debounce_samples < 1 or window_s <= 0:
+        raise ValueError("Invalid debounce or feature-window configuration")
 
-    model_path = Path(C.env("AI_STATE_PATH", "models/herdsense_online.json"))
+    model_path = Path(C.env("AI_MODEL_PATH", "models/herdsense_gbc.joblib"))
     if not model_path.is_absolute():
         model_path = C.ROOT / model_path
-    model_path = group_model_path(model_path, C.GROUP_ID)
-    ai_model = OnlineGaussianNB.load_or_create(model_path, ai_min_samples)
-    print(
-        f"[detector] online AI ready; per-class warm-up={ai_min_samples} samples, "
-        f"state={model_path}"
-    )
+    ai_model = HerdSenseModel.load(model_path)
+    print(f"[detector] Gradient Boosting model loaded: {model_path}")
 
     session_id = uuid.uuid4().hex
     log_path = Path(C.env("DATA_LOG_PATH", "data/detector.csv"))
@@ -85,10 +109,9 @@ def main() -> None:
 
     members: dict[str, Member] = {}
     memory: dict = {}
-    stable_rules: dict[str, dict] = {}
     stable_statuses: dict[str, dict] = {}
     histories: dict[str, list[dict]] = {}
-    last_training_signature: dict[str, tuple] = {}
+    last_history_seen: dict[str, float] = {}
     last_seq: dict[str, int] = {}
     last_alert: dict[str, float] = {}
     lock = threading.Lock()
@@ -131,21 +154,25 @@ def main() -> None:
             m = snap[n]
             age_s = round(now - m.last_seen, 1)
             history = histories.setdefault(n, [])
-            history.append({
-                "ts": now, "lat": m.lat, "lon": m.lon, "accuracy_m": m.accuracy_m,
-                "motion_rms": m.motion_rms, "distance_m": r["distance_m"],
-            })
+            if append_history_sample(
+                history, m, r["distance_m"], now, last_history_seen.get(n)
+            ):
+                last_history_seen[n] = m.last_seen
             cutoff = now - window_s
             while history and history[0]["ts"] < cutoff:
                 history.pop(0)
             features = build_features(history, m, r["distance_m"], age_s, now, window_s)
 
-            rule_status = debounce_status(r["status"], stable_rules.setdefault(n, {}), debounce_samples)
-            proposed_status, status_source, ai_status, ai_confidence = ai_model.decide(
-                rule_status, features, confidence_threshold
-            )
+            rule_status = r["status"]
+            if rule_status == LOST:
+                ai_status, ai_confidence = None, None
+                status_source = "RULE_SAFETY"
+            else:
+                ai_status, ai_confidence = ai_model.predict(features)
+                status_source = "RULES"
+
             ai_reason = None
-            if ai_status:
+            if ai_status is not None:
                 ai_reason = (
                     f"{features['samples_in_window']:.0f} samples / {window_s:.0f}s; "
                     f"distance={features['nearest_distance_m']:.0f}m, "
@@ -155,18 +182,9 @@ def main() -> None:
                     f"GPS accuracy={features['accuracy_m']:.0f}m"
                 )
 
-            final_status = debounce_status(
-                proposed_status, stable_statuses.setdefault(n, {}), debounce_samples
+            final_status = debounced_status(
+                rule_status, stable_statuses.setdefault(n, {}), debounce_samples
             )
-
-            training_signature = (
-                m.last_seen, rule_status, r["distance_m"], r["nearest"]
-            )
-            if (rule_status != INITIALIZING
-                    and last_training_signature.get(n) != training_signature):
-                ai_model.update(rule_status, features)
-                last_training_signature[n] = training_signature
-                ai_model.save(model_path)
             member_status = {
                 **r,
                 "rule_status": rule_status,
@@ -175,9 +193,6 @@ def main() -> None:
                 "ai_confidence": None if ai_confidence is None else round(ai_confidence, 3),
                 "ai_reason": ai_reason,
                 "status_source": status_source,
-                "ai_model_ready": ai_model.is_ready,
-                "ai_training_samples": sum(ai_model.sample_counts.values()),
-                "ai_samples_per_class": ai_model.sample_counts,
                 "lat": m.lat,
                 "lon": m.lon,
                 "accuracy_m": m.accuracy_m,
@@ -193,18 +208,19 @@ def main() -> None:
 
         for n, r in status["members"].items():
             cur, prev, d = r["status"], prevs[n], r["distance_m"]
+            distance_text = format_distance(d)
             if cur == SEPARATED and (prev != SEPARATED or now - last_alert.get(n, 0) >= cooldown):
                 last_alert[n] = now
-                alert("warn", n, f"{n} is {d:.0f} m from the group")
+                alert("warn", n, f"{n} is {distance_text} from the group")
             elif cur == WAITING and prev not in (WAITING, SEPARATED):
-                alert("info", n, f"{n} stopped {d:.0f} m away from the group")
+                alert("info", n, f"{n} stopped {distance_text} from the group")
             elif cur == TOGETHER and prev in (WAITING, SEPARATED):
                 alert("info", n, f"{n} is back with the group")
             elif cur == LOST and prev not in (LOST, None):
                 alert("info", n, f"No signal from {n}")
 
         print(time.strftime("%H:%M:%S"), " | ".join(
-        f"{n}:{r['status']} ({r['status_source']}, ai:{r['ai_status'] or 'learning'})"
+            f"{n}:{r['status']} ({r['status_source']}, ai:{r['ai_status'] or 'safety'})"
             f":{'-' if r['distance_m'] is None else str(int(r['distance_m'])) + 'm'}"
             for n, r in status["members"].items()))
 

@@ -64,8 +64,16 @@ const P = { host: q.get("host") || "broker.hivemq.com", port: q.get("port") || "
             tls: q.get("tls") !== "false", user: q.get("user") || undefined, pass: q.get("pass") || undefined };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const LABEL = { TOGETHER:"Together", STRAGGLER_WAITING:"Stopped behind", SEPARATED:"Separated", LOST_SIGNAL:"No signal" };
-const COLOR = { TOGETHER:"var(--ok)", STRAGGLER_WAITING:"var(--warn)", SEPARATED:"var(--bad)", LOST_SIGNAL:"var(--off)" };
+const LABEL = {
+  TOGETHER:"Aman", STRAGGLER_WAITING:"Tertinggal", SEPARATED:"Terpisah", LOST_SIGNAL:"No signal",
+  AMAN:"AMAN", "MULAI MENJAUH":"MULAI MENJAUH", TERTINGGAL:"TERTINGGAL", TERPISAH:"TERPISAH"
+};
+const COLOR = {
+  TOGETHER:"var(--ok)", AMAN:"var(--ok)",
+  STRAGGLER_WAITING:"var(--warn)", TERTINGGAL:"var(--warn)",
+  SEPARATED:"var(--bad)", TERPISAH:"var(--bad)", "MULAI MENJAUH":"var(--warn)",
+  LOST_SIGNAL:"var(--off)"
+};
 let client = null, status = null, alerts = [], lastStatusAt = 0, connectedAt = 0;
 
 function setConn(on) { $("conn").style.background = on ? "var(--ok)" : "var(--off)"; $("connText").textContent = on ? "connected" : "disconnected"; }
@@ -112,9 +120,9 @@ function render() {
   if (!status) { rows.innerHTML = '<tr><td colspan="8" class="empty">Waiting for data...</td></tr>'; $("map").innerHTML = ""; return; }
   rows.innerHTML = Object.entries(status.members).sort().map(([n, m]) => `<tr>
     <td>${esc(n)}</td>
-    <td title="Decision source: ${esc(m.status_source || "unknown")}"><span class="badge" style="background:${COLOR[m.status] || "var(--off)"}">${esc(LABEL[m.status] || m.status)}</span><small class="source">${m.status_source === "AI" ? "AI decision" : "Rule warm-up/fallback"}</small></td>
+    <td title="Decision source: ${esc(m.status_source || "unknown")}"><span class="badge" style="background:${COLOR[m.status] || "var(--off)"}">${esc(LABEL[m.status] || m.status)}</span><small class="source">${m.status_source === "RULE_SAFETY" ? "Safety override" : "Rules + debounce"}</small></td>
     <td>${esc(LABEL[m.rule_status] || m.rule_status || "-")}</td>
-    <td title="${m.ai_status ? esc(m.ai_reason || "Online AI prediction from the rolling sensor window") : "AI is learning from incoming member telemetry"}">${m.ai_status ? esc(LABEL[m.ai_status] || m.ai_status) + " (" + esc(Math.round(m.ai_confidence * 100)) + "%)" : "Learning (" + esc(m.ai_training_samples || 0) + ")"}</td>
+    <td title="${m.ai_status ? esc(m.ai_reason || "Gradient Boosting prediction from the rolling sensor window") : "AI prediction is unavailable while signal is lost"}">${m.ai_status ? esc(LABEL[m.ai_status] || m.ai_status) + " (" + esc(Math.round(m.ai_confidence * 100)) + "%)" : "Unavailable (no signal)"}</td>
     <td>${m.distance_m == null ? "-" : esc(Math.round(m.distance_m)) + " m" + (m.nearest ? " (" + esc(m.nearest) + ")" : "")}</td>
     <td>${m.motion_rms == null ? "?" : (m.moving ? "moving" : "still")}</td>
     <td>${m.accuracy_m == null ? "-" : esc(Math.round(m.accuracy_m)) + " m"}</td>

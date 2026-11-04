@@ -1,8 +1,8 @@
 # HerdSense - Group Travel Tracker
 
-Ponsel mengirim data GPS dan akselerometer lewat MQTT. Detector mengumpulkan telemetri,
-memperkirakan anggota yang tertinggal, lalu mengirim peringatan ke ponsel. Dashboard web
-menampilkan status rombongan secara langsung.
+Ponsel mengirim data GPS dan akselerometer lewat MQTT. Detector menjalankan aturan keselamatan
+dan model Gradient Boosting yang dilatih dari trip berlabel. Dashboard web menampilkan status
+aturan, prediksi AI beserta probabilitas, dan peringatan secara langsung.
 
 **Presented by Group 8 - IoT Kelas A Informatika UNDIP**
 
@@ -26,7 +26,8 @@ ponsel (Termux)  <--MQTT-->  broker  <--MQTT-->  detector.py
 | Edge: baca sensor, proses, publish telemetri, terima peringatan | `phone.py` |
 | Aturan fusi jarak dan gerakan, murni dan teruji | `rules.py`, `tests/` |
 | Detector, pencatatan fitur, dan peringatan | `detector.py`, `data_logger.py`, `features.py` |
-| Model AI online Gaussian Naive Bayes | `ai_model.py` |
+| Simulator data berlabel ground-truth dan fitur bersama | `generate_dataset.py`, `features.py`, `ml_labels.py` |
+| Training, evaluasi held-out, dan ekspor model Gradient Boosting | `train_model.py`, `ai_model.py` |
 | Dashboard | `dashboard/index.html` |
 | Pengecekan kesiapan ponsel dan MQTT | `check_phone.py` |
 | Konfigurasi bersama dan helper MQTT | `common.py` |
@@ -40,7 +41,7 @@ sama lain. Mereka menggunakan alamat broker dan `GROUP_ID` yang sama.
 |---|---|---|
 | Broker MQTT | Meneruskan pesan publish/subscribe; tidak mengambil keputusan. Default: `broker.hivemq.com` | Server internet |
 | `phone.py` (edge) | Membaca GPS dan akselerometer setiap `SEND_INTERVAL_S`, mengirim telemetri, menerima peringatan | Setiap ponsel Android dengan Termux |
-| `detector.py` | Mengumpulkan telemetri anggota, menjalankan aturan dan AI online, menerbitkan status dan peringatan | Satu perangkat dengan Python dan internet |
+| `detector.py` | Mengumpulkan telemetri anggota, menjalankan aturan dan inferensi AI, menerbitkan status dan peringatan | Satu perangkat dengan Python dan internet |
 | `dashboard/index.html` | Menampilkan status dan peringatan yang diterima; tidak menghitung status | Browser melalui Live Server/file statis dan MQTT WebSocket |
 
 Detector sebaiknya dijalankan **tepat satu kali per grup**. Ponsel simulator mengirim format
@@ -82,14 +83,12 @@ Detector mengevaluasi data setiap sekitar **4 detik**. Interval kirim ponsel sec
    bergantung pada perbedaan jam ponsel.
 2. **Hitung status:** `rules.evaluate()` menggabungkan jarak dan gerakan, memeriksa sinyal kedaluwarsa,
    serta menyaring noise jarak.
-3. **Stabilkan:** perubahan status harus muncul selama beberapa siklus berturut-turut sebelum
-   diterbitkan.
-4. **Prediksi dan belajar:** model Gaussian Naive Bayes memprediksi dari 15 fitur jendela sensor,
-   lalu belajar dari status aturan yang sudah stabil sebagai pseudo-label. Prediksi dihitung sebelum
-   sampel terbaru dipakai untuk belajar, untuk menghindari kebocoran target pada sampel yang sama.
-   Model diperbarui hanya saat telemetri/jarak anggota berubah dan disimpan terpisah per grup.
-5. **Publikasikan dan catat:** detector menerbitkan status lengkap ke topik `status` (retained),
-   mengirim peringatan saat status berubah, dan menulis fitur/keputusan ke CSV.
+3. **Bangun fitur dan prediksi:** gunakan jendela sensor 30 detik yang sama untuk CSV dan model;
+   model Gradient Boosting mengeluarkan satu dari empat label beserta probabilitas kelas.
+4. **Stabilkan dan publikasikan:** status operasional dan peringatan tetap memakai rules dengan
+   satu debounce. Model adalah prediksi evaluasi dan tidak menggantikan rules keselamatan.
+5. **Catat:** detector menerbitkan status lengkap ke topik `status` (retained) dan menulis fitur,
+   prediksi, probabilitas, serta baseline rules ke CSV.
 
 ### Fusi sensor berbasis aturan
 
@@ -105,27 +104,38 @@ Detector mengevaluasi data setiap sekitar **4 detik**. Interval kirim ponsel sec
 - **Debounce:** kandidat status harus berurutan sebanyak `DEBOUNCE_SAMPLES` siklus. Dengan interval
   detector empat detik dan nilai default tiga sampel, transisi dapat tertunda sekitar 8-12 detik.
 
-### Model AI online
+### AI: input, output, dan keselamatan
 
-Model AI merupakan bagian dari alur detector, bukan file model yang perlu diunduh atau dilatih
-manual lebih dulu. Ponsel tetap mengirim telemetri GPS dan gerakan seperti sebelumnya. Detector
-mengubah setiap jendela telemetri menjadi 15 fitur numerik, lalu:
+Detector menghitung **15 fitur numerik dari jendela 30 detik per anggota**: jarak terdekat,
+tren jarak, kecepatan GPS, RMS gerakan, akurasi GPS, usia data, statistik jarak/kecepatan/gerakan/
+akurasi dalam jendela, jumlah sampel, dan durasi jendela. Fitur yang sama dipakai saat membuat
+dataset, melatih model, dan inferensi live.
 
-1. Meminta model memprediksi `TOGETHER`, `STRAGGLER_WAITING`, `SEPARATED`, atau `LOST_SIGNAL`
-   beserta confidence.
-2. Pada awal penggunaan dan saat confidence belum cukup, memakai status rules sebagai keluaran
-   sementara dan menampilkan bahwa model sedang belajar.
-3. Setelah terdapat sedikitnya `AI_MIN_SAMPLES_PER_CLASS` contoh untuk dua kelas, memakai prediksi
-   AI dengan confidence minimal `AI_MIN_CONFIDENCE` sebagai kandidat status. Kandidat tetap melalui
-   debounce sebelum menjadi status akhir/peringatan.
-4. Memperbarui model setelah prediksi menggunakan status rules stabil sebagai **pseudo-label**.
-   Data statistik model disimpan otomatis pada file grup-spesifik di `models/`.
+Model Gradient Boosting menghasilkan:
 
-**Batasan penting:** karena label training live berasal dari rules, model belajar meniru pola rules
-dan belum membuktikan peningkatan akurasi atau menjadi ground truth independen. Untuk mengukur
-akurasi nyata, kumpulkan label kondisi yang diverifikasi manusia dan evaluasi pada sesi terpisah.
-Model tidak mengirim GPS mentah ke model tersimpan; file model berisi statistik fitur per kelas.
-`AI_STATE_PATH` dapat dihapus/diganti untuk memulai pembelajaran baru bagi grup tersebut.
+| Label model | Makna |
+|---|---|
+| `AMAN` | Bergerak bersama / tidak menunjukkan pola menjauh |
+| `MULAI MENJAUH` | Jarak bertambah tetapi belum mencapai pola terpisah |
+| `TERTINGGAL` | Jauh dan relatif diam |
+| `TERPISAH` | Jauh serta bergerak menjauhi rombongan |
+
+Dashboard menampilkan prediksi dan probabilitas kelas tertinggi. Label AI **tidak menggantikan**
+status operasional, alarm, maupun rules: peringatan tetap memakai rules dan satu tahap debounce.
+`LOST_SIGNAL` selalu menjadi safety override rules dan tidak diprediksi oleh model.
+
+Model bukan lagi dilatih dari pseudo-label rules. `generate_dataset.py` membuat sesi perjalanan
+simulasi dengan posisi ground-truth dan pembacaan GPS/gerakan yang diberi noise; label berasal
+dari skenario/kondisi sebenarnya, bukan keluaran rules. `train_model.py` melatih
+`GradientBoostingClassifier`, memisahkan sesi utuh ke training/validation/test agar jendela yang
+berdekatan tidak bocor, membandingkan model dengan rules pada baris test yang sama, lalu mengekspor
+`models/herdsense_gbc.joblib`. File model contoh tersebut dibuat dari data sintetis agar demo bisa
+langsung dijalankan; hasil sintetis **bukan bukti akurasi dunia nyata**.
+
+Untuk evaluasi yang lebih kuat, isi kolom `label` di CSV dari satu atau lebih sesi nyata yang
+ditinjau manual menggunakan empat label di atas, lalu gunakan file CSV itu sebagai input training.
+Sisihkan beberapa `session_id` sebagai test yang tidak pernah dipakai untuk training. Jangan
+mengklaim akurasi nyata dari data simulasi atau split acak per baris.
 
 ### Status
 
@@ -179,9 +189,7 @@ yang sudah diatur di terminal akan mengesampingkan `.env`.
 | `ALERT_COOLDOWN_S` | `30` | Jeda pengulangan peringatan terpisah |
 | `FEATURE_WINDOW_S` | `30` | Jendela fitur sensor untuk logging/model |
 | `DATA_LOG_PATH` | `data/detector.csv` | Lokasi CSV log detector |
-| `AI_STATE_PATH` | `models/herdsense_online.json` | Awalan lokasi state model; file aktual dipisah menurut hash grup |
-| `AI_MIN_SAMPLES_PER_CLASS` | `5` | Contoh minimal per kelas sebelum AI boleh memprediksi status |
-| `AI_MIN_CONFIDENCE` | `0.60` | Confidence minimum agar prediksi AI menjadi kandidat status |
+| `AI_MODEL_PATH` | `models/herdsense_gbc.joblib` | Model Gradient Boosting hasil training yang dimuat detector |
 | `SIM_LAT` / `SIM_LON` | Jakarta pusat | Titik awal ponsel simulator; tidak digunakan ponsel asli |
 
 ## Persiapan dan Menjalankan
@@ -195,7 +203,7 @@ yang sudah diatur di terminal akan mengesampingkan `.env`.
    pkg install python git termux-api
    ```
 
-3. Clone repositori, masuk folder proyek, lalu pasang dependensi:
+3. Clone repositori dan masuk folder proyek. Ponsel hanya perlu dependensi MQTT:
 
    ```sh
    git clone <repo>
@@ -207,13 +215,20 @@ yang sudah diatur di terminal akan mengesampingkan `.env`.
    yang unik. Jangan membagikan `.env`.
 5. Jalankan `python check_phone.py` sampai semua pemeriksaan menunjukkan `READY`.
 6. Sebelum menjalankan `phone.py`, jalankan `termux-wake-lock` agar Android tidak menidurkan proses.
-7. Jalankan detector di **satu perangkat saja**:
+7. Pada perangkat yang menjalankan detector, pasang dependency AI. `requirements-ai.txt`
+   menggunakan versi scikit-learn yang sama dengan model yang disediakan:
+
+   ```sh
+   pip install -r requirements-ai.txt
+   ```
+
+8. Jalankan detector di **satu perangkat saja**:
 
    ```sh
    python detector.py
    ```
 
-8. Di setiap ponsel:
+9. Di setiap ponsel:
 
    ```sh
    python phone.py
@@ -301,30 +316,70 @@ memasukkan kredensial ke URL yang dapat dibagikan atau disimpan dalam riwayat br
 Jangan kirim `GROUP_ID`, password broker, token, ataupun isi `.env` ke chat atau screenshot.
 Broker publik tidak menyediakan privasi atau ACL hanya karena topiknya memakai nama grup.
 
-## Pengumpulan Data dan Pembelajaran AI
+## Training di Google Colab
 
-Model AI online Gaussian Naive Bayes berjalan langsung di detector dan tidak memerlukan paket
-training tambahan. Ponsel tetap mengirim input GPS/akselerometer melalui MQTT. Detector mengubah
-input itu menjadi 15 fitur per anggota, memprediksi status, lalu memperbarui statistik model dari
-status rules yang sudah stabil sebagai pseudo-label.
+1. Buat notebook Colab baru, lalu jalankan:
 
-Data fitur dan hasil keputusan dicatat ke `data/detector.csv`. Kolom `label` disediakan untuk label
-ground-truth yang diverifikasi manual pada evaluasi; model online tidak memakai kolom itu untuk
-belajar. File state model disimpan terpisah untuk setiap grup di `models/` dan dimuat kembali saat
-detector dijalankan ulang. File `data/` dan `models/` diabaikan Git.
+   ```python
+   !git clone https://github.com/eugenehehehe/herdsense.git
+   %cd /content/herdsense
+   !pip install -r requirements.txt -r requirements-ai.txt
+   ```
 
-Untuk demo, jalankan detector dan ponsel/simulator seperti di bagian sebelumnya. Model belajar
-otomatis dari anggota aktif dan menyimpan statistiknya. Selama warm-up status rules tetap menjaga
-keluaran. Setelah model mengumpulkan cukup sampel di sedikitnya dua kelas dan confidence melampaui
-`AI_MIN_CONFIDENCE`, prediksi AI digunakan sebagai kandidat status dan tetap melewati debounce.
-Dashboard menunjukkan prediksi, confidence, sumber status, dan jumlah contoh yang telah dipelajari.
+2. Buat perjalanan simulasi dengan empat label ground-truth dan GPS noisy:
 
-Uji skenario yang berbeda: diam di tempat untuk merekam noise GPS, berjalan bersama, menjauh,
-berhenti jauh, dan sinyal hilang. **Pseudo-label membuat AI belajar dari keputusan rules, sehingga
-model ini adaptif terhadap input grup tetapi belum merupakan evaluasi akurasi independen.**
-Untuk mengukur akurasi model terhadap kondisi nyata, anotasi kolom `label` secara manual pada
-sesi-sesi terpisah, lalu bandingkan prediksi AI dan status rules pada data yang tidak digunakan
-untuk pembelajaran.
+   ```python
+   !python generate_dataset.py --output data/synthetic_dataset.csv --sessions 120 --seed 42
+   ```
+
+3. Latih, evaluasi di sesi validation/test terpisah, dan bandingkan dengan baseline rules:
+
+   ```python
+   !python train_model.py --input data/synthetic_dataset.csv --output models/herdsense_gbc.joblib
+   ```
+
+   Script mencetak accuracy, macro-F1, laporan tiap kelas dan hasil rules pada baris test yang
+   sama. Pastikan khususnya recall kelas `TERPISAH`; jangan memilih model hanya dari accuracy.
+   Split dilakukan berdasarkan `session_id`, bukan baris/sampel.
+
+4. Unduh model hasil training ke komputer:
+
+   ```python
+   from google.colab import files
+   files.download("models/herdsense_gbc.joblib")
+   ```
+
+5. Ganti `models/herdsense_gbc.joblib` lokal dengan file unduhan. Simpan `.joblib` dari sumber
+   tepercaya saja, karena file model serialisasi dapat menjalankan kode saat dimuat. Versi
+   scikit-learn harus sesuai `requirements-ai.txt`.
+
+Untuk training cepat tanpa Colab, jalankan dua command generator dan trainer yang sama di PowerShell
+dari folder proyek:
+
+```powershell
+python generate_dataset.py --output data\synthetic_dataset.csv --sessions 120 --seed 42
+python train_model.py --input data\synthetic_dataset.csv --output models\herdsense_gbc.joblib
+```
+
+`models/herdsense_gbc.joblib` yang disertakan di repository adalah model demo yang dibuat dari
+data sintetis sehingga detector siap dijalankan; model tersebut tetap harus dianggap model
+evaluasi awal, bukan model tervalidasi untuk pemakaian nyata.
+
+## Log sesi nyata dan pelabelan
+
+Detector menyimpan fitur 30 detik, status rules, prediksi AI, dan confidence ke
+`data/detector.csv`. `session_id` dibuat setiap kali detector dimulai. Isi kolom `label` secara
+manual setelah meninjau kondisi aktual pada setiap baris, menggunakan `AMAN`, `MULAI MENJAUH`,
+`TERTINGGAL`, atau `TERPISAH`. Baris tanpa label diabaikan trainer. Sediakan setidaknya enam
+session terlabel dan pastikan setiap kelas ada pada sesi training. Contoh training dari file anotasi:
+
+```powershell
+python train_model.py --input data\detector-labeled.csv --output models\herdsense_gbc.joblib
+```
+
+Jangan gabungkan sampel dari sesi test ke training. Untuk laporan yang mewakili penggunaan nyata,
+gunakan sesi yang dianotasi manual dan bandingkan model/rules pada test set yang sama. Metrik
+simulator hanya mengukur kemampuan model pada simulator, bukan pada kondisi lapangan.
 
 ## Pengujian
 
