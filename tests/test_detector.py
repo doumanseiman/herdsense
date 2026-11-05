@@ -5,11 +5,12 @@ from detector import (
     append_history_sample,
     debounced_status,
     format_distance,
+    choose_status,
     parse,
     prediction_guard_reason,
 )
 from rules import LOST, SEPARATED, TOGETHER, Member
-from ml_labels import APART, MOVING_AWAY
+from ml_labels import APART, MOVING_AWAY, SAFE, STRAGGLER
 
 
 class DetectorParseTest(unittest.TestCase):
@@ -72,6 +73,20 @@ class DetectorParseTest(unittest.TestCase):
         self.assertIsNone(
             prediction_guard_reason(MOVING_AWAY, TOGETHER, 90.0, 100.0, 0.02)
         )
+
+
+class AiDecidesTest(unittest.TestCase):
+    def test_model_decides_when_not_vetoed(self):
+        self.assertEqual(choose_status(TOGETHER, MOVING_AWAY, None), (MOVING_AWAY, "AI_MODEL"))
+
+    def test_rules_take_over_when_vetoed_or_signal_lost(self):
+        self.assertEqual(choose_status(TOGETHER, APART, "why"), (SAFE, "RULES_GUARD"))
+        self.assertEqual(choose_status(LOST, None, None), (LOST, "RULE_SAFETY"))
+
+    def test_resting_group_is_not_reported_as_stopped_behind(self):
+        reason = prediction_guard_reason(STRAGGLER, TOGETHER, 15.0, 100.0, 0.0)
+        self.assertIsNotNone(reason)
+        self.assertEqual(choose_status(TOGETHER, STRAGGLER, reason), (SAFE, "RULES_GUARD"))
 
 
 if __name__ == "__main__":

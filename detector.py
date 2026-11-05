@@ -15,7 +15,7 @@ import common as C
 from ai_model import HerdSenseModel
 from data_logger import DetectorCsvLogger
 from features import build_features
-from ml_labels import APART, MOVING_AWAY
+from ml_labels import APART, MOVING_AWAY, RULE_TO_LABEL, STRAGGLER
 from rules import (
     LOST,
     SEPARATED,
@@ -86,6 +86,15 @@ def debounced_status(rule_status: str, state: dict, required_samples: int) -> st
     return debounce_status(rule_status, state, required_samples)
 
 
+def choose_status(rule_status: str, ai_status: str | None, guard_reason: str | None) -> tuple[str, str]:
+    """Return (candidate status, source). The model decides; rules take over when it is unavailable or contradicted."""
+    if rule_status == LOST or ai_status is None:
+        return rule_status, "RULE_SAFETY"
+    if guard_reason is not None:
+        return RULE_TO_LABEL.get(rule_status, rule_status), "RULES_GUARD"
+    return ai_status, "AI_MODEL"
+
+
 def prediction_guard_reason(
     prediction: str,
     rule_status: str,
@@ -93,11 +102,11 @@ def prediction_guard_reason(
     threshold_m: float,
     distance_trend_ratio_s: float,
 ) -> str | None:
-    if prediction not in (MOVING_AWAY, APART):
+    if prediction not in (MOVING_AWAY, APART, STRAGGLER):
         return None
     if distance_m is None:
         return "no usable distance to a group member"
-    if prediction == APART and rule_status == TOGETHER and distance_m < threshold_m:
+    if prediction in (APART, STRAGGLER) and rule_status == TOGETHER and distance_m < threshold_m:
         return "rules report TOGETHER within the separation limit"
     if prediction == MOVING_AWAY and (
         distance_m <= threshold_m * 0.8
@@ -205,11 +214,9 @@ def main() -> None:
             rule_status = r["status"]
             if rule_status == LOST:
                 ai_status, ai_confidence = None, None
-                status_source = "RULE_SAFETY"
                 ai_guard_reason = None
             else:
                 ai_status, ai_confidence = ai_model.predict(features)
-                status_source = "RULES"
                 ai_guard_reason = prediction_guard_reason(
                     ai_status,
                     rule_status,
@@ -217,6 +224,8 @@ def main() -> None:
                     r["threshold_m"],
                     features["distance_trend_ratio_s"],
                 )
+
+            candidate_status, status_source = choose_status(rule_status, ai_status, ai_guard_reason)
 
             ai_reason = None
             if ai_status is not None:
@@ -230,7 +239,7 @@ def main() -> None:
                 )
 
             final_status = debounced_status(
-                rule_status, stable_statuses.setdefault(n, {}), debounce_samples
+                candidate_status, stable_statuses.setdefault(n, {}), debounce_samples
             )
             member_status = {
                 **r,
