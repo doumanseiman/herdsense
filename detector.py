@@ -15,6 +15,7 @@ import common as C
 from ai_model import HerdSenseModel
 from data_logger import DetectorCsvLogger
 from features import build_features
+from ml_labels import APART, MOVING_AWAY
 from rules import (
     LOST,
     SEPARATED,
@@ -25,6 +26,8 @@ from rules import (
     debounce_status,
     evaluate,
 )
+
+MIN_OUTWARD_TREND_RATIO_S = 0.01
 
 
 def parse(topic: str, payload: bytes):
@@ -54,6 +57,7 @@ def append_history_sample(
     distance_m: float | None,
     received_at: float,
     last_seen: float | None,
+    threshold_m: float = 100.0,
 ) -> bool:
     """Append only when this member has delivered a new telemetry sample."""
     if last_seen == member.last_seen:
@@ -65,6 +69,7 @@ def append_history_sample(
         "accuracy_m": member.accuracy_m,
         "motion_rms": member.motion_rms,
         "distance_m": distance_m,
+        "threshold_m": threshold_m,
     })
     return True
 
@@ -79,6 +84,27 @@ def debounced_status(rule_status: str, state: dict, required_samples: int) -> st
         state["stable"] = LOST
         return LOST
     return debounce_status(rule_status, state, required_samples)
+
+
+def prediction_guard_reason(
+    prediction: str,
+    rule_status: str,
+    distance_m: float | None,
+    threshold_m: float,
+    distance_trend_ratio_s: float,
+) -> str | None:
+    if prediction not in (MOVING_AWAY, APART):
+        return None
+    if distance_m is None:
+        return "no usable distance to a group member"
+    if prediction == APART and rule_status == TOGETHER and distance_m < threshold_m:
+        return "rules report TOGETHER within the separation limit"
+    if prediction == MOVING_AWAY and (
+        distance_m <= threshold_m * 0.8
+        or distance_trend_ratio_s <= MIN_OUTWARD_TREND_RATIO_S
+    ):
+        return "distance is not clearly increasing beyond the hysteresis range"
+    return None
 
 
 def main() -> None:
@@ -101,7 +127,7 @@ def main() -> None:
     print(f"[detector] Gradient Boosting model loaded: {model_path}")
 
     session_id = uuid.uuid4().hex
-    log_path = Path(C.env("DATA_LOG_PATH", "data/detector.csv"))
+    log_path = Path(C.env("DATA_LOG_PATH", "data/detector_v2.csv"))
     if not log_path.is_absolute():
         log_path = C.ROOT / log_path
     csv_logger = DetectorCsvLogger(log_path, session_id)
@@ -155,28 +181,49 @@ def main() -> None:
             age_s = round(now - m.last_seen, 1)
             history = histories.setdefault(n, [])
             if append_history_sample(
-                history, m, r["distance_m"], now, last_history_seen.get(n)
+                history,
+                m,
+                r["distance_m"],
+                now,
+                last_history_seen.get(n),
+                r["threshold_m"],
             ):
                 last_history_seen[n] = m.last_seen
             cutoff = now - window_s
             while history and history[0]["ts"] < cutoff:
                 history.pop(0)
-            features = build_features(history, m, r["distance_m"], age_s, now, window_s)
+            features = build_features(
+                history,
+                m,
+                r["distance_m"],
+                age_s,
+                now,
+                window_s,
+                r["threshold_m"],
+            )
 
             rule_status = r["status"]
             if rule_status == LOST:
                 ai_status, ai_confidence = None, None
                 status_source = "RULE_SAFETY"
+                ai_guard_reason = None
             else:
                 ai_status, ai_confidence = ai_model.predict(features)
                 status_source = "RULES"
+                ai_guard_reason = prediction_guard_reason(
+                    ai_status,
+                    rule_status,
+                    r["distance_m"],
+                    r["threshold_m"],
+                    features["distance_trend_ratio_s"],
+                )
 
             ai_reason = None
             if ai_status is not None:
                 ai_reason = (
                     f"{features['samples_in_window']:.0f} samples / {window_s:.0f}s; "
-                    f"distance={features['nearest_distance_m']:.0f}m, "
-                    f"trend={features['distance_trend_mps']:+.2f}m/s, "
+                    f"distance={features['nearest_distance_ratio']:.2f}x limit, "
+                    f"trend={features['distance_trend_ratio_s']:+.3f}x limit/s, "
                     f"speed={features['speed_mps']:.2f}m/s, "
                     f"motion RMS={features['motion_rms']:.2f}, "
                     f"GPS accuracy={features['accuracy_m']:.0f}m"
@@ -192,6 +239,8 @@ def main() -> None:
                 "ai_status": ai_status,
                 "ai_confidence": None if ai_confidence is None else round(ai_confidence, 3),
                 "ai_reason": ai_reason,
+                "ai_guarded": ai_guard_reason is not None,
+                "ai_guard_reason": ai_guard_reason,
                 "status_source": status_source,
                 "lat": m.lat,
                 "lon": m.lon,

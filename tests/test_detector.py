@@ -1,8 +1,15 @@
 import json
 import unittest
 
-from detector import append_history_sample, debounced_status, format_distance, parse
-from rules import LOST, SEPARATED, Member
+from detector import (
+    append_history_sample,
+    debounced_status,
+    format_distance,
+    parse,
+    prediction_guard_reason,
+)
+from rules import LOST, SEPARATED, TOGETHER, Member
+from ml_labels import APART, MOVING_AWAY
 
 
 class DetectorParseTest(unittest.TestCase):
@@ -48,6 +55,23 @@ class DetectorParseTest(unittest.TestCase):
         state = {"stable": SEPARATED, "pending": SEPARATED, "count": 2}
         self.assertEqual(debounced_status(LOST, state, 3), LOST)
         self.assertEqual(state, {"stable": LOST})
+
+    def test_prediction_guard_rejects_apart_prediction_close_to_group(self):
+        reason = prediction_guard_reason(APART, TOGETHER, 15.0, 100.0, 0.0)
+        self.assertIn("TOGETHER", reason)
+
+    def test_prediction_guard_rejects_drift_without_increasing_distance(self):
+        reason = prediction_guard_reason(MOVING_AWAY, TOGETHER, 60.0, 100.0, 0.0)
+        self.assertIn("not clearly increasing", reason)
+
+    def test_prediction_guard_rejects_small_gps_noise_trend(self):
+        reason = prediction_guard_reason(MOVING_AWAY, TOGETHER, 90.0, 100.0, 0.003)
+        self.assertIn("not clearly increasing", reason)
+
+    def test_prediction_guard_allows_drift_with_increasing_distance(self):
+        self.assertIsNone(
+            prediction_guard_reason(MOVING_AWAY, TOGETHER, 90.0, 100.0, 0.02)
+        )
 
 
 if __name__ == "__main__":

@@ -14,9 +14,24 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import GroupShuffleSplit
 
 from features import FEATURE_NAMES
-from ml_labels import MODEL_LABELS, RULE_TO_LABEL
+from ml_labels import APART, MODEL_LABELS, MOVING_AWAY, RULE_TO_LABEL, SAFE, STRAGGLER
 
-MODEL_FORMAT_VERSION = 1
+MODEL_FORMAT_VERSION = 2
+BASELINE_LABELS = ("NOT_SEPARATED", STRAGGLER, APART)
+BASELINE_LABEL_MAP = {
+    SAFE: "NOT_SEPARATED",
+    MOVING_AWAY: "NOT_SEPARATED",
+    STRAGGLER: STRAGGLER,
+    APART: APART,
+}
+RULE_BASELINE_LABEL_MAP = {
+    "TOGETHER": "NOT_SEPARATED",
+    "STRAGGLER_WAITING": STRAGGLER,
+    "SEPARATED": APART,
+    SAFE: "NOT_SEPARATED",
+    STRAGGLER: STRAGGLER,
+    APART: APART,
+}
 
 
 def load_rows(path: Path) -> tuple[list[list[float]], list[str], list[str], list[str]]:
@@ -74,12 +89,19 @@ def split_sessions(groups: list[str], seed: int) -> tuple[list[int], list[int], 
     return train, validation, test
 
 
-def print_metrics(title: str, expected: list[str], predicted: list[str]) -> None:
+def print_metrics(
+    title: str,
+    expected: list[str],
+    predicted: list[str],
+    labels: tuple[str, ...] = MODEL_LABELS,
+) -> None:
     print(f"\n{title}")
     print(f"  accuracy: {accuracy_score(expected, predicted):.3f}")
-    print(f"  macro F1: {f1_score(expected, predicted, labels=MODEL_LABELS, average='macro', zero_division=0):.3f}")
+    print(
+        f"  macro F1: {f1_score(expected, predicted, labels=labels, average='macro', zero_division=0):.3f}"
+    )
     print(classification_report(
-        expected, predicted, labels=MODEL_LABELS, target_names=MODEL_LABELS, zero_division=0
+        expected, predicted, labels=labels, target_names=labels, zero_division=0
     ))
 
 
@@ -110,14 +132,32 @@ def train(input_path: Path, output_path: Path, seed: int) -> None:
     test_prediction = estimator.predict(np.asarray(x)[test_ids]).tolist()
     print_metrics("Held-out test sessions", test_expected, test_prediction)
 
-    baseline_indices = [i for i in test_ids if rule_labels[i]]
+    baseline_indices = [
+        i for i in test_ids if rule_labels[i] in RULE_BASELINE_LABEL_MAP
+    ]
     if not baseline_indices:
         raise ValueError("Held-out test set has no rows with a comparable rules baseline")
     print_metrics(
-        f"Rules baseline on same held-out rows ({len(baseline_indices)}/{len(test_ids)} covered)",
-        [y[i] for i in baseline_indices],
-        [rule_labels[i] for i in baseline_indices],
+        f"Model on same baseline-covered test rows, three shared classes "
+        f"({len(baseline_indices)}/{len(test_ids)} covered)",
+        [BASELINE_LABEL_MAP[y[i]] for i in baseline_indices],
+        [BASELINE_LABEL_MAP[test_prediction[test_ids.index(i)]] for i in baseline_indices],
+        BASELINE_LABELS,
     )
+    print_metrics(
+        f"Rules baseline, three shared classes on same test rows "
+        f"({len(baseline_indices)}/{len(test_ids)} covered)",
+        [BASELINE_LABEL_MAP[y[i]] for i in baseline_indices],
+        [RULE_BASELINE_LABEL_MAP[rule_labels[i]] for i in baseline_indices],
+        BASELINE_LABELS,
+    )
+    print("\nTop model features")
+    for name, importance in sorted(
+        zip(FEATURE_NAMES, estimator.feature_importances_),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:8]:
+        print(f"  {name}: {importance:.3f}")
 
     artifact = {
         "format_version": MODEL_FORMAT_VERSION,

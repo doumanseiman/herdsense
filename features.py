@@ -1,19 +1,20 @@
 """Windowed, numeric features shared by detector logging and model inference."""
 from __future__ import annotations
 
+import math
 import statistics
 
 from rules import Member, haversine_m
 
 FEATURE_NAMES = (
-    "nearest_distance_m",
-    "distance_trend_mps",
+    "nearest_distance_ratio",
+    "distance_trend_ratio_s",
     "speed_mps",
     "motion_rms",
     "accuracy_m",
     "age_s",
-    "window_distance_mean_m",
-    "window_distance_std_m",
+    "window_distance_mean_ratio",
+    "window_distance_std_ratio",
     "window_speed_mean_mps",
     "window_speed_max_mps",
     "window_motion_mean_rms",
@@ -31,8 +32,12 @@ def build_features(
     age_s: float,
     now: float,
     window_s: float = 30.0,
+    separation_limit_m: float = 100.0,
 ) -> dict[str, float]:
-    """Build the same 15-feature rolling window for logging and inference."""
+    """Build rolling features, expressing distance relative to the effective limit."""
+    if not math.isfinite(separation_limit_m) or separation_limit_m <= 0:
+        raise ValueError("separation_limit_m must be a positive finite number")
+
     window = [sample for sample in history if now - sample["ts"] <= window_s]
     if not window:
         window = [{
@@ -42,9 +47,13 @@ def build_features(
             "accuracy_m": member.accuracy_m,
             "motion_rms": member.motion_rms,
             "distance_m": distance_m,
+            "threshold_m": separation_limit_m,
         }]
 
-    distances = [float(s["distance_m"]) for s in window if s["distance_m"] is not None]
+    distance_ratios = [
+        float(sample["distance_m"]) / float(sample.get("threshold_m", separation_limit_m))
+        for sample in window if sample["distance_m"] is not None
+    ]
     motions = [float(s["motion_rms"]) for s in window if s["motion_rms"] is not None]
     accuracies = [float(s["accuracy_m"]) for s in window]
     speeds: list[float] = []
@@ -55,21 +64,30 @@ def build_features(
                 previous["lat"], previous["lon"], current["lat"], current["lon"]
             ) / elapsed)
 
-    first_distance = distances[0] if distances else 0.0
-    last_distance = distances[-1] if distances else 0.0
+    first_distance_ratio = distance_ratios[0] if distance_ratios else 0.0
+    last_distance_ratio = distance_ratios[-1] if distance_ratios else 0.0
     elapsed_window = max(0.0, window[-1]["ts"] - window[0]["ts"])
-    trend = (last_distance - first_distance) / elapsed_window if elapsed_window else 0.0
+    trend = (
+        (last_distance_ratio - first_distance_ratio) / elapsed_window
+        if elapsed_window else 0.0
+    )
     motion_mean = statistics.fmean(motions) if motions else -1.0
     motion_max = max(motions, default=-1.0)
     return {
-        "nearest_distance_m": float(distance_m) if distance_m is not None else -1.0,
-        "distance_trend_mps": trend,
+        "nearest_distance_ratio": (
+            float(distance_m) / separation_limit_m if distance_m is not None else -1.0
+        ),
+        "distance_trend_ratio_s": trend,
         "speed_mps": speeds[-1] if speeds else 0.0,
         "motion_rms": float(member.motion_rms) if member.motion_rms is not None else -1.0,
         "accuracy_m": float(member.accuracy_m),
         "age_s": float(age_s),
-        "window_distance_mean_m": statistics.fmean(distances) if distances else -1.0,
-        "window_distance_std_m": statistics.pstdev(distances) if len(distances) > 1 else 0.0,
+        "window_distance_mean_ratio": (
+            statistics.fmean(distance_ratios) if distance_ratios else -1.0
+        ),
+        "window_distance_std_ratio": (
+            statistics.pstdev(distance_ratios) if len(distance_ratios) > 1 else 0.0
+        ),
         "window_speed_mean_mps": statistics.fmean(speeds) if speeds else 0.0,
         "window_speed_max_mps": max(speeds, default=0.0),
         "window_motion_mean_rms": motion_mean,

@@ -106,10 +106,11 @@ Detector mengevaluasi data setiap sekitar **4 detik**. Interval kirim ponsel sec
 
 ### AI: input, output, dan keselamatan
 
-Detector menghitung **15 fitur numerik dari jendela 30 detik per anggota**: jarak terdekat,
-tren jarak, kecepatan GPS, RMS gerakan, akurasi GPS, usia data, statistik jarak/kecepatan/gerakan/
-akurasi dalam jendela, jumlah sampel, dan durasi jendela. Fitur yang sama dipakai saat membuat
-dataset, melatih model, dan inferensi live.
+Detector menghitung **15 fitur numerik dari jendela 30 detik per anggota**: jarak dan tren jarak
+yang dinormalisasi terhadap ambang pemisahan efektif, kecepatan GPS, RMS gerakan, akurasi GPS,
+usia data, statistik jarak/kecepatan/gerakan/akurasi dalam jendela, jumlah sampel, dan durasi
+jendela. Normalisasi jarak membuat model memahami posisi relatif terhadap batas, bukan menghafal
+jarak meter tertentu. Fitur yang sama dipakai saat membuat dataset, melatih model, dan inferensi.
 
 Model Gradient Boosting menghasilkan:
 
@@ -128,7 +129,13 @@ Model bukan lagi dilatih dari pseudo-label rules. `generate_dataset.py` membuat 
 simulasi dengan posisi ground-truth dan pembacaan GPS/gerakan yang diberi noise; label berasal
 dari skenario/kondisi sebenarnya, bukan keluaran rules. `train_model.py` melatih
 `GradientBoostingClassifier`, memisahkan sesi utuh ke training/validation/test agar jendela yang
-berdekatan tidak bocor, membandingkan model dengan rules pada baris test yang sama, lalu mengekspor
+berdekatan tidak bocor, memakai batas jarak simulasi yang bervariasi dan perjalanan kontinu, lalu
+membandingkan model dengan rules pada baris test yang sama untuk tiga kelas yang bisa dibandingkan
+(AMAN dan MULAI MENJAUH digabung untuk baseline karena rules tidak membedakan keduanya).
+Gerakan akselerometer pada skenario berjalan bersama, menjauh, dan terpisah memakai rentang yang
+sama agar intensitas berjalan saja tidak menjadi penentu label. Detector menandai prediksi
+`MULAI MENJAUH`/`TERPISAH` sebagai guarded bila jarak atau trennya bertentangan dengan rules.
+Model kemudian mengekspor
 `models/herdsense_gbc.joblib`. File model contoh tersebut dibuat dari data sintetis agar demo bisa
 langsung dijalankan; hasil sintetis **bukan bukti akurasi dunia nyata**.
 
@@ -188,7 +195,7 @@ yang sudah diatur di terminal akan mengesampingkan `.env`.
 | `DEBOUNCE_SAMPLES` | `3` | Sampel berturut-turut untuk konfirmasi transisi |
 | `ALERT_COOLDOWN_S` | `30` | Jeda pengulangan peringatan terpisah |
 | `FEATURE_WINDOW_S` | `30` | Jendela fitur sensor untuk logging/model |
-| `DATA_LOG_PATH` | `data/detector.csv` | Lokasi CSV log detector |
+| `DATA_LOG_PATH` | `data/detector_v2.csv` | Lokasi CSV log detector |
 | `AI_MODEL_PATH` | `models/herdsense_gbc.joblib` | Model Gradient Boosting hasil training yang dimuat detector |
 | `SIM_LAT` / `SIM_LON` | Jakarta pusat | Titik awal ponsel simulator; tidak digunakan ponsel asli |
 

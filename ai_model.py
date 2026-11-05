@@ -10,7 +10,7 @@ import sklearn
 from features import FEATURE_NAMES
 from ml_labels import MODEL_LABELS
 
-MODEL_FORMAT_VERSION = 1
+MODEL_FORMAT_VERSION = 2
 
 
 class HerdSenseModel:
