@@ -15,7 +15,7 @@ import common as C
 from ai_model import HerdSenseModel
 from data_logger import DetectorCsvLogger
 from features import build_features
-from ml_labels import APART, MOVING_AWAY, RULE_TO_LABEL, STRAGGLER
+from ml_labels import APART, MOVING_AWAY, RULE_TO_LABEL, SAFE, STRAGGLER
 from rules import (
     LOST,
     SEPARATED,
@@ -113,6 +113,28 @@ def prediction_guard_reason(
         or distance_trend_ratio_s <= MIN_OUTWARD_TREND_RATIO_S
     ):
         return "distance is not clearly increasing beyond the hysteresis range"
+    return None
+
+
+def decide_alert(
+    cur: str,
+    prev: str | None,
+    distance_m: float | None,
+    now: float,
+    last_alert: float,
+    cooldown: float,
+) -> tuple[str, str] | None:
+    distance_text = format_distance(distance_m)
+    if cur in (APART, SEPARATED) and (prev not in (APART, SEPARATED) or now - last_alert >= cooldown):
+        return "warn", f"is {distance_text} from the group"
+    if cur in (MOVING_AWAY,) and prev not in (MOVING_AWAY, APART, SEPARATED):
+        return "info", f"is starting to drift away ({distance_text})"
+    if cur in (STRAGGLER, WAITING) and prev not in (STRAGGLER, WAITING, APART, SEPARATED):
+        return "info", f"stopped {distance_text} from the group"
+    if cur in (SAFE, TOGETHER) and prev in (MOVING_AWAY, STRAGGLER, WAITING, APART, SEPARATED):
+        return "info", "is back with the group"
+    if cur == LOST and prev not in (LOST, None):
+        return "info", "no signal"
     return None
 
 
@@ -266,16 +288,15 @@ def main() -> None:
 
         for n, r in status["members"].items():
             cur, prev, d = r["status"], prevs[n], r["distance_m"]
-            distance_text = format_distance(d)
-            if cur == SEPARATED and (prev != SEPARATED or now - last_alert.get(n, 0) >= cooldown):
-                last_alert[n] = now
-                alert("warn", n, f"{n} is {distance_text} from the group")
-            elif cur == WAITING and prev not in (WAITING, SEPARATED):
-                alert("info", n, f"{n} stopped {distance_text} from the group")
-            elif cur == TOGETHER and prev in (WAITING, SEPARATED):
-                alert("info", n, f"{n} is back with the group")
-            elif cur == LOST and prev not in (LOST, None):
-                alert("info", n, f"No signal from {n}")
+            ev = decide_alert(cur, prev, d, now, last_alert.get(n, 0), cooldown)
+            if ev:
+                level, msg = ev
+                if level == "warn":
+                    last_alert[n] = now
+                if msg == "no signal":
+                    alert(level, n, f"No signal from {n}")
+                else:
+                    alert(level, n, f"{n} {msg}")
 
         print(time.strftime("%H:%M:%S"), " | ".join(
             f"{n}:{r['status']} ({r['status_source']}, ai:{r['ai_status'] or 'safety'})"

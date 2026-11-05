@@ -4,6 +4,7 @@ import unittest
 from detector import (
     append_history_sample,
     debounced_status,
+    decide_alert,
     format_distance,
     choose_status,
     parse,
@@ -87,6 +88,43 @@ class AiDecidesTest(unittest.TestCase):
         reason = prediction_guard_reason(STRAGGLER, TOGETHER, 15.0, 100.0, 0.0)
         self.assertIsNotNone(reason)
         self.assertEqual(choose_status(TOGETHER, STRAGGLER, reason), (SAFE, "RULES_GUARD"))
+
+
+class DecideAlertTest(unittest.TestCase):
+    def test_apart_and_separated_trigger_warning_with_cooldown(self):
+        self.assertEqual(
+            decide_alert(APART, SAFE, 2500.0, 100.0, 0.0, 30.0),
+            ("warn", "is 2500 m from the group"),
+        )
+        self.assertIsNone(decide_alert(APART, APART, 2500.0, 110.0, 100.0, 30.0))
+        self.assertEqual(
+            decide_alert(APART, APART, 2500.0, 140.0, 100.0, 30.0),
+            ("warn", "is 2500 m from the group"),
+        )
+        self.assertEqual(
+            decide_alert(SEPARATED, TOGETHER, 120.0, 100.0, 0.0, 30.0),
+            ("warn", "is 120 m from the group"),
+        )
+
+    def test_moving_away_triggers_early_drift_info(self):
+        self.assertEqual(
+            decide_alert(MOVING_AWAY, SAFE, 60.0, 100.0, 0.0, 30.0),
+            ("info", "is starting to drift away (60 m)"),
+        )
+
+    def test_straggler_and_recovery_alerts(self):
+        self.assertEqual(
+            decide_alert(STRAGGLER, SAFE, 120.0, 100.0, 0.0, 30.0),
+            ("info", "stopped 120 m from the group"),
+        )
+        self.assertEqual(
+            decide_alert(SAFE, APART, 10.0, 100.0, 0.0, 30.0),
+            ("info", "is back with the group"),
+        )
+        self.assertEqual(
+            decide_alert(LOST, SAFE, None, 100.0, 0.0, 30.0),
+            ("info", "no signal"),
+        )
 
 
 if __name__ == "__main__":

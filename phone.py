@@ -61,7 +61,7 @@ def read_gps() -> dict | None:
     for provider in ("gps", "network"):
         try:
             out = subprocess.run(["termux-location", "-p", provider, "-r", "once"],
-                                 capture_output=True, text=True, timeout=20).stdout
+                                 capture_output=True, text=True, timeout=5).stdout
             d = json.loads(out)
             return {"lat": d["latitude"], "lon": d["longitude"], "accuracy_m": d.get("accuracy")}
         except (OSError, subprocess.TimeoutExpired, ValueError, KeyError):
