@@ -120,7 +120,7 @@ function render() {
   if (!status) { rows.innerHTML = '<tr><td colspan="8" class="empty">Waiting for data...</td></tr>'; $("map").innerHTML = ""; return; }
   rows.innerHTML = Object.entries(status.members).sort().map(([n, m]) => `<tr>
     <td>${esc(n)}</td>
-    <td title="Decision source: ${esc(m.status_source || "unknown")}"><span class="badge" style="background:${COLOR[m.status] || "var(--off)"}">${esc(LABEL[m.status] || m.status)}</span><small class="source">${m.status_source === "RULE_SAFETY" ? "Safety override" : "Rules + debounce"}</small></td>
+    <td title="Decision source: ${esc(m.status_source || "unknown")}"><span class="badge" style="background:${COLOR[m.status] || "var(--off)"}">${esc(LABEL[m.status] || m.status)}</span><small class="source">${m.status_source === "RULE_SAFETY" ? "Safety override" : (m.status_source === "AI_MODEL" ? "AI + debounce" : (m.status_source === "RULES_GUARD" ? "Rules (AI vetoed) + debounce" : "Rules + debounce"))}</small></td>
     <td>${esc(LABEL[m.rule_status] || m.rule_status || "-")}</td>
     <td title="${m.ai_status ? esc((m.ai_reason || "Gradient Boosting prediction from the rolling sensor window") + (m.ai_guard_reason ? "; guarded: " + m.ai_guard_reason : "")) : "AI prediction is unavailable while signal is lost"}">${m.ai_status ? esc(LABEL[m.ai_status] || m.ai_status) + " (" + esc(Math.round(m.ai_confidence * 100)) + "%)" + (m.ai_guarded ? " [guarded]" : "") : "Unavailable (no signal)"}</td>
     <td>${m.distance_m == null ? "-" : esc(Math.round(m.distance_m)) + " m" + (m.nearest ? " (" + esc(m.nearest) + ")" : "")}</td>
