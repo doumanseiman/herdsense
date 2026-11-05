@@ -1,3 +1,4 @@
+import csv
 import random
 import tempfile
 import unittest
@@ -40,6 +41,16 @@ class OfflineTrainingTest(unittest.TestCase):
                 row[motion_index] for row, label in zip(features, labels)
                 if label == "TERPISAH"
             ]
+            motion_max_index = FEATURE_NAMES.index("window_motion_max_rms")
+            distance_index = FEATURE_NAMES.index("nearest_distance_ratio")
+            resting_safe = [
+                row for row, label in zip(features, labels)
+                if label == "AMAN"
+                and row[motion_index] <= 0.25
+                and row[motion_max_index] <= 0.25
+                and row[distance_index] < 1.0
+            ]
+            self.assertGreaterEqual(len(resting_safe), 8)
             self.assertLess(
                 max(min(safe_motion), min(drift_motion)),
                 min(max(safe_motion), max(drift_motion)),
@@ -62,7 +73,7 @@ class OfflineTrainingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             dataset = Path(directory) / "trips.csv"
             model_path = Path(directory) / "model.joblib"
-            make_dataset(dataset, sessions=8, seed=11, cfg=Config())
+            make_dataset(dataset, sessions=120, seed=11, cfg=Config())
             train(dataset, model_path, seed=13)
 
             model = HerdSenseModel.load(model_path)
@@ -71,6 +82,23 @@ class OfflineTrainingTest(unittest.TestCase):
             self.assertIn(label, MODEL_LABELS)
             self.assertGreaterEqual(confidence, 0.0)
             self.assertLessEqual(confidence, 1.0)
+
+            _, labels, _, _ = load_rows(dataset)
+            self.assertIn("AMAN", labels)
+            with dataset.open("r", newline="", encoding="utf-8") as source:
+                resting_rows = [
+                    row for row in csv.DictReader(source)
+                    if row["label"] == "AMAN"
+                    and float(row["motion_rms"]) <= 0.25
+                    and float(row["window_motion_max_rms"]) <= 0.25
+                    and float(row["nearest_distance_ratio"]) < 1.0
+                ]
+            self.assertTrue(resting_rows)
+            resting_features = {
+                name: float(resting_rows[-1][name]) for name in FEATURE_NAMES
+            }
+            resting_prediction, _ = model.predict(resting_features)
+            self.assertEqual(resting_prediction, "AMAN")
 
             for distance_ratio in (0.3, 0.6, 0.8):
                 brisk_walking_together = dict(values)

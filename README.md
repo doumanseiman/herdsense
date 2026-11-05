@@ -132,9 +132,12 @@ dari skenario/kondisi sebenarnya, bukan keluaran rules. `train_model.py` melatih
 berdekatan tidak bocor, memakai batas jarak simulasi yang bervariasi dan perjalanan kontinu, lalu
 membandingkan model dengan rules pada baris test yang sama untuk tiga kelas yang bisa dibandingkan
 (AMAN dan MULAI MENJAUH digabung untuk baseline karena rules tidak membedakan keduanya).
+Simulator juga menyertakan skenario seluruh grup beristirahat berdekatan: kedua anggota diam dan
+label ground-truth tetap `AMAN`. Ini mengajarkan model bahwa diam saja tidak berarti tertinggal.
 Gerakan akselerometer pada skenario berjalan bersama, menjauh, dan terpisah memakai rentang yang
-sama agar intensitas berjalan saja tidak menjadi penentu label. Detector menandai prediksi
-`MULAI MENJAUH`/`TERPISAH` sebagai guarded bila jarak atau trennya bertentangan dengan rules.
+sama agar intensitas berjalan saja tidak menjadi penentu label. Dashboard menandai prediksi AI
+sebagai `(vetoed)` langsung di kolom prediksi bila guard rules menolaknya; status operasional tetap
+mengikuti rules.
 Model kemudian mengekspor
 `models/herdsense_gbc.joblib`. File model contoh tersebut dibuat dari data sintetis agar demo bisa
 langsung dijalankan; hasil sintetis **bukan bukti akurasi dunia nyata**.

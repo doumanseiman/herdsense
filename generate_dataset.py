@@ -5,7 +5,6 @@ import argparse
 import csv
 import math
 import random
-import uuid
 from dataclasses import replace
 from pathlib import Path
 
@@ -66,7 +65,7 @@ def make_dataset(
         writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
         writer.writeheader()
         for session_number in range(sessions):
-            session_id = f"sim-{session_number + 1:04d}-{uuid.uuid4().hex[:8]}"
+            session_id = f"sim-{seed}-{session_number + 1:04d}"
             base_lat = rng.uniform(-45.0, 45.0)
             base_lon = rng.uniform(-150.0, 150.0)
             angle = rng.uniform(0.0, 2 * math.pi)
@@ -74,12 +73,16 @@ def make_dataset(
             session_cfg = replace(cfg, separation_m=limit_m)
             start_distance = rng.uniform(0.08, 0.85) * limit_m
             far_distance = rng.uniform(1.25, 1.65) * limit_m
+            resting_distance = rng.uniform(0.05, 0.2) * limit_m
+            walking_distance = 0.6 * limit_m
 
             moving_out_count = rng.randint(18, 30)
             still_count = rng.randint(9, 15)
             moving_home_count = rng.randint(18, 30)
             safe_count = rng.randint(8, 14)
             phases = (
+                ("resting", resting_distance, resting_distance, False, rng.randint(10, 14)),
+                ("together", walking_distance, walking_distance, False, rng.randint(8, 14)),
                 ("together", start_distance, start_distance, False, rng.randint(8, 14)),
                 ("outward", start_distance, far_distance, True, moving_out_count),
                 ("still", far_distance, far_distance, False, still_count),
@@ -96,7 +99,7 @@ def make_dataset(
                 for sample_index in range(count):
                     fraction = sample_index / max(1, count - 1)
                     true_distance = begin_distance + (end_distance - begin_distance) * fraction
-                    if behavior == "still":
+                    if behavior in ("still", "resting"):
                         motion = rng.uniform(0.02, 0.25)
                     else:
                         motion = rng.uniform(0.4, 2.5)
@@ -122,7 +125,11 @@ def make_dataset(
                         group_lat,
                         group_lon,
                         group_accuracy,
-                        rng.uniform(0.4, 2.5),
+                        (
+                            rng.uniform(0.02, 0.25)
+                            if behavior == "resting"
+                            else rng.uniform(0.4, 2.5)
+                        ),
                         time_s,
                     )
                     member = Member(
